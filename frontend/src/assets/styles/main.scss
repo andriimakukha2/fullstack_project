@@ -1,0 +1,14 @@
+// Базові стилі
+@import "./base/reset";
+@import "./base/typography";
+
+// Компоненти
+@import "./components/buttons";
+@import "./components/forms";
+@import "./components/navbar";
+
+// Сторінки
+@import "./pages/register";
+@import "./pages/login";
+@import "./pages/home";
+@import "./pages/profile";
