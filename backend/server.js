@@ -1,129 +1,123 @@
-import express from 'express';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import dotenv from 'dotenv';
-import cors from 'cors';
-import rateLimit from 'express-rate-limit';
-import Redis from 'ioredis';
-import webpush from './config/push.js';
-import connectDB from './config/db.js';
-import authRoutes from './routes/authRoutes.js';
-import postRoutes from './routes/postRoutes.js';
-import followRoutes from './routes/followRoutes.js';
-import likeRoutes from './routes/likeRoutes.js';
-import commentRoutes from './routes/commentRoutes.js';
-import favoriteRoutes from './routes/favoriteRoutes.js';
-import messageRoutes from './routes/messageRoutes.js';
-import pushRoutes from './routes/pushRoutes.js';
-import Message from './models/Message.js';
-import logger from './middleware/logger.js';
-import errorHandler from './middleware/errorHandler.js';
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import dotenv from "dotenv";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import Redis from "ioredis";
+import jwt from "jsonwebtoken";
+import webpush from "./config/push.js";
+import connectDB from "./config/db.js";
+import authRoutes from "./routes/authRoutes.js";
+import postRoutes from "./routes/postRoutes.js";
+import followRoutes from "./routes/followRoutes.js";
+import likeRoutes from "./routes/likeRoutes.js";
+import commentRoutes from "./routes/commentRoutes.js";
+import favoriteRoutes from "./routes/favoriteRoutes.js";
+import messageRoutes from "./routes/messageRoutes.js";
+import pushRoutes from "./routes/pushRoutes.js";
+import Message from "./models/Message.js";
+import logger from "./middleware/logger.js";
+import errorHandler from "./middleware/errorHandler.js";
 
 dotenv.config();
 const app = express();
-
-// Підключення до MongoDB
 connectDB();
-
-// Підключення до Redis
 const redis = new Redis();
-
 const PORT = process.env.PORT || 5001;
 
-// Ліміт запитів на повідомлення
 const messageLimiter = rateLimit({
-    windowMs: 60 * 1000, // 1 хвилина
-    max: 20, // Не більше 20 запитів за хвилину
-    message: 'Забагато запитів! Спробуйте пізніше.'
+    windowMs: 60 * 1000,
+    max: 20,
+    message: "Забагато запитів! Спробуйте пізніше."
 });
 
 app.use(express.json());
 app.use(cors());
 app.use(logger);
+app.use("/api/messages", messageLimiter);
 
-// Ліміти запитів застосовуються перед маршрутами
-app.use('/api/messages', messageLimiter);
-
-// Підключення маршрутів
-app.use('/api/auth', authRoutes);
-app.use('/api/posts', postRoutes);
-app.use('/api/follow', followRoutes);
-app.use('/api/likes', likeRoutes);
-app.use('/api/comments', commentRoutes);
-app.use('/api/favorites', favoriteRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/push', pushRoutes);
-
+app.use("/api/auth", authRoutes);
+app.use("/api/posts", postRoutes);
+app.use("/api/follow", followRoutes);
+app.use("/api/likes", likeRoutes);
+app.use("/api/comments", commentRoutes);
+app.use("/api/favorites", favoriteRoutes);
+app.use("/api/messages", messageRoutes);
+app.use("/api/push", pushRoutes);
 app.use(errorHandler);
 
-// Основний маршрут
-app.get('/', (req, res) => {
-    res.send('API працює!');
-});
+app.get("/", (req, res) => res.send("API працює!"));
 
-// HTTP-сервер для WebSocket
+// **WebSocket-сервер**
 const server = http.createServer(app);
-
-// **WebSocketServer**
 const wss = new WebSocketServer({ server });
+const onlineSockets = new Map();
 
-// **Відстеження онлайн-користувачів через Redis**
-wss.on('connection', (ws) => {
-    console.log('🔌 Користувач підключився до WebSocket');
+wss.on("connection", async (ws, req) => {
+    const token = req.url.split("token=")[1];
 
-    ws.on('message', async (messageData) => {
-        try {
-            const data = JSON.parse(messageData);
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const userId = decoded.id;
+        onlineSockets.set(userId, ws);
+        console.log(`🔌 Користувач ${userId} підключився`);
 
-            if (data.type === 'ONLINE') {
-                await redis.set(`online:${data.userId}`, 'true', 'EX', 3600);
-                console.log(`🟢 Користувач ${data.userId} онлайн`);
-            }
-            else if (data.type === 'OFFLINE') {
-                await redis.del(`online:${data.userId}`);
-                console.log(`🔴 Користувач ${data.userId} офлайн`);
-            }
-            else {
-                const { sender, recipient, text } = data;
-                const message = new Message({ sender, recipient, text });
-                await message.save();
+        await redis.set(`online:${userId}`, "true", "EX", 3600);
 
-                const isRecipientOnline = await redis.exists(`online:${recipient}`);
+        ws.on("message", async (messageData) => {
+            try {
+                const data = JSON.parse(messageData);
 
-                if (isRecipientOnline) {
-                    wss.clients.forEach(client => {
-                        if (client.readyState === ws.OPEN) {
-                            client.send(JSON.stringify(message));
+                if (data.type === "MESSAGE") {
+                    const { recipient, text } = data;
+                    const message = new Message({ sender: userId, recipient, text });
+                    await message.save();
+
+                    const recipientSocket = onlineSockets.get(recipient);
+                    if (recipientSocket && recipientSocket.readyState === ws.OPEN) {
+                        recipientSocket.send(JSON.stringify(message));
+                    } else {
+                        const subscription = await redis.get(`push:${recipient}`);
+                        if (subscription) {
+                            webpush.sendNotification(
+                                JSON.parse(subscription),
+                                JSON.stringify({ title: "Нове повідомлення!", body: text })
+                            );
                         }
-                    });
-                } else {
-                    const subscription = await redis.get(`push:${recipient}`);
-                    if (subscription) {
-                        webpush.sendNotification(
-                            JSON.parse(subscription),
-                            JSON.stringify({
-                                title: 'Нове повідомлення!',
-                                body: text,
-                            })
+                    }
+                }
+
+                if (data.type === "DELETE_MESSAGE") {
+                    await Message.findByIdAndDelete(data.messageId);
+                    const recipientSocket = onlineSockets.get(data.recipient);
+                    if (recipientSocket && recipientSocket.readyState === ws.OPEN) {
+                        recipientSocket.send(
+                            JSON.stringify({ type: "MESSAGE_DELETED", messageId: data.messageId })
                         );
                     }
                 }
-            }
-        } catch (error) {
-            console.error('❌ Помилка WebSocket:', error);
-        }
-    });
 
-    ws.on('close', async () => {
-        await redis.keys('online:*').then(keys => {
-            keys.forEach(async key => {
-                const userId = key.split(':')[1];
-                await redis.del(key);
-                console.log(`🔴 Користувач ${userId} офлайн`);
-            });
+                if (data.type === "TYPING") {
+                    const recipientSocket = onlineSockets.get(data.recipient);
+                    if (recipientSocket && recipientSocket.readyState === ws.OPEN) {
+                        recipientSocket.send(JSON.stringify({ type: "TYPING", sender: data.sender }));
+                    }
+                }
+            } catch (error) {
+                console.error("❌ Помилка WebSocket:", error);
+            }
         });
-    });
+
+        ws.on("close", async () => {
+            onlineSockets.delete(userId);
+            await redis.del(`online:${userId}`);
+            console.log(`🔴 Користувач ${userId} офлайн`);
+        });
+    } catch (error) {
+        console.log("❌ Невірний токен WebSocket:", error);
+        ws.close();
+    }
 });
 
-// Запуск сервера
 server.listen(PORT, () => console.log(`🚀 Сервер і WebSocket запущено на порту ${PORT}`));
